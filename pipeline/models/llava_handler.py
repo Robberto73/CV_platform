@@ -13,7 +13,7 @@ class LocalLLaVAUnavailable(RuntimeError):
 
 @dataclass
 class LocalLLaVAConfig:
-    model_id: str = "llava-hf/llava-v1.6-mistral-7b-hf"
+    model_id: str = "llava-v1.6-mistral-7b-hf"
     torch_dtype: torch.dtype = torch.float16
     device_map: str = "auto"
     max_new_tokens: int = 256
