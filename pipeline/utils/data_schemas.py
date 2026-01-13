@@ -7,9 +7,7 @@ from pydantic import BaseModel, Field
 
 class ParseUserRequestResult(BaseModel):
     require_visual_analysis: bool = False
-    required_models: list[
-        Literal["yolov8-person", "yolov8-product", "reid-tracker", "zone-detector"]
-    ] = Field(default_factory=list)
+    required_models: list[str] = Field(default_factory=list)
     json_required: bool = False
 
 

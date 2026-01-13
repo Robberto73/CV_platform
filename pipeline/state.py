@@ -18,8 +18,13 @@ class PipelineState(TypedDict, total=False):
     ui_mode: Literal["STANDARD", "PRO"]
     pro_settings: ProSettings
     require_json: bool
-    llm_type: Literal["local", "gigachat"]
+    # routing: отдельно выбираем модель для анализа кадров и отдельно для финального ответа
+    vision_llm: Literal["llava_local", "gigachat_api", "off"]
+    final_llm: Literal["gigachat_api", "llava_local"]
     gigachat_api_key: Optional[str]
+    gigachat_ca_cert_path: Optional[str]
+    analyze_people: bool
+    force_no_visual_analysis: bool
 
     # derived by parse_user_request
     required_models: List[str]
@@ -38,6 +43,10 @@ class PipelineState(TypedDict, total=False):
     # final
     final_answer: Any
     models_used: List[str]
+    events_summary: Dict[str, Any]
+    query_evidence: Dict[str, Any]
+    final_prompt: str
+    person_routes: Dict[str, Any]
 
     # output & logs
     output_dir: str

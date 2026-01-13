@@ -34,6 +34,8 @@ def build_graph():
         any_frames = any(len(v) > 0 for v in key_frames.values())
         if not any_frames or not state.get("require_visual_analysis", True):
             return "generate_final_answer"
+        if state.get("vision_llm", "llava_local") == "off":
+            return "generate_final_answer"
         return "run_llava_analysis"
 
     g.add_conditional_edges(

@@ -6,7 +6,8 @@ __pycache__/
 .mypy_cache/
 .DS_Store
 .idea/
-llava-v1.6-mistral-7b-hf
+llava-v1.6-mistral-7b-hf/
+config/russian_trusted_root_ca*
 
 out/
 .tmp_uploads/

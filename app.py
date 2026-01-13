@@ -7,8 +7,22 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
-from streamlit_agraph import Config, Edge, Node, agraph
+import hashlib
+try:
+    from streamlit_agraph import Config, Edge, Node, agraph
 
+    _AGRAPH_AVAILABLE = True
+except Exception:
+    Config = Edge = Node = agraph = None  # type: ignore
+    _AGRAPH_AVAILABLE = False
+
+from pipeline.config import (
+    describe_loaded_config_for_ui,
+    load_app_settings,
+    load_gigachat_ca_bundle_file,
+    load_gigachat_default_key,
+    save_app_settings,
+)
 from pipeline.run_pipeline import run_pipeline
 from pipeline.state import PipelineState
 
@@ -30,6 +44,9 @@ def _save_uploads(files: list[Any]) -> list[str]:
 
 
 def _render_timeline(output_dir: str, events_df: pd.DataFrame) -> None:
+    if not _AGRAPH_AVAILABLE:
+        st.warning("streamlit-agraph не доступен в окружении — визуализация отключена.")
+        return
     if events_df.empty:
         st.info("Нет событий для визуализации.")
         return
@@ -37,13 +54,23 @@ def _render_timeline(output_dir: str, events_df: pd.DataFrame) -> None:
     nodes = []
     edges = []
     last_id = None
+    safe_to_event_id: dict[str, str] = {}
+
+    def _safe_node_id(raw: str) -> str:
+        # streamlit_agraph иногда пытается загрузить Node.id как статический ресурс;
+        # для event_id с точками/слешами это может приводить к FileNotFoundError.
+        # Делаем безопасный детерминированный id.
+        return "ev_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
     for _, row in events_df.sort_values("timestamp_sec").iterrows():
         ev_id = str(row.get("event_id", ""))
         label = f"{row.get('timestamp_sec', 0):.1f}s • {row.get('event_type','')}"
-        nodes.append(Node(id=ev_id, label=label, size=18))
+        sid = _safe_node_id(ev_id)
+        safe_to_event_id[sid] = ev_id
+        nodes.append(Node(id=sid, label=label, size=18, title=ev_id))
         if last_id is not None:
-            edges.append(Edge(source=last_id, target=ev_id))
-        last_id = ev_id
+            edges.append(Edge(source=last_id, target=sid))
+        last_id = sid
 
     cfg = Config(
         width="100%",
@@ -56,8 +83,9 @@ def _render_timeline(output_dir: str, events_df: pd.DataFrame) -> None:
 
     # best-effort: показать кадр, если он был закэширован
     if isinstance(sel, dict) and sel.get("selected"):
-        selected_id = sel["selected"]
-        st.caption(f"Выбрано событие: {selected_id}")
+        selected_safe_id = str(sel["selected"])
+        selected_event_id = safe_to_event_id.get(selected_safe_id, selected_safe_id)
+        st.caption(f"Выбрано событие: {selected_event_id}")
         frames_dir = os.path.join(output_dir, "cache", "frames")
         if os.path.isdir(frames_dir):
             # пробуем найти jpg по basename+frame_id — в этой версии это best-effort
@@ -73,13 +101,41 @@ st.title("Платформа анализа видео (LangGraph + Multimodal L
 with st.sidebar:
     st.header("Настройки")
 
+    cfg_info = describe_loaded_config_for_ui()
+    with st.expander("Config (debug)", expanded=False):
+        st.write(
+            {
+                "llava_model_id": cfg_info["llava_model_id"],
+                "yolo_model_path": cfg_info["yolo_model_path"],
+                "osnet_reid_model": cfg_info["osnet_reid_model"],
+                "gigachat_key_present": cfg_info["gigachat_key_present"],
+            }
+        )
+
     ui_mode = st.radio("Режим", ["STANDARD", "PRO"], index=0, horizontal=True)
+    force_no_visual_analysis = st.checkbox(
+        "CV-only (без LLaVA/GigaChat)",
+        value=False,
+        help="Полезно для слабого ПК: пропускает мультимодальную LLM, но оставляет CV обработку и сохранение результатов.",
+    )
+
+    app_settings = load_app_settings()
+    analyze_people = st.checkbox(
+        "Анализ людей (YOLOv8)",
+        value=bool(app_settings.get("analyze_people_default", True)),
+        help="Если включено, детекция людей будет активна по умолчанию (yolov8n.pt).",
+    )
+    if st.button("Сохранить настройки по умолчанию"):
+        app_settings["analyze_people_default"] = bool(analyze_people)
+        save_app_settings(app_settings)
+        st.success("Сохранено в config/app_settings.yaml")
 
     pro_settings = {
         "frame_sampling_rate": 1.0,
         "ssim_threshold": 0.9,
         "skip_static_frames": True,
-        "cache_frames": True,
+        # По умолчанию выключаем: запись JPG на диск и упаковка в zip сильно замедляют обработку.
+        "cache_frames": False,
         "custom_preprocessing": "None",
     }
     if ui_mode == "PRO":
@@ -96,15 +152,78 @@ with st.sidebar:
             ["None", "Blur Detection (stub)", "Motion Emphasis (stub)"],
             index=0,
         )
+        pro_settings["reid_event_mode"] = st.selectbox(
+            "ReID события: режим детализации",
+            ["segments (best practice)", "frames (detailed)"],
+            index=0,
+            help="Segments — компактные стоп-сегменты/переходы (лучше для длинных видео). Frames — события по кадрам/точкам (детально, но тяжелее).",
+        )
+        # нормализуем в внутреннее значение
+        pro_settings["reid_event_mode"] = "segments" if "segments" in pro_settings["reid_event_mode"] else "frames"
+        if pro_settings["reid_event_mode"] == "frames":
+            pro_settings["reid_frames_min_dt_sec"] = st.slider(
+                "ReID frames: min_dt_sec (downsample)",
+                min_value=0.0,
+                max_value=5.0,
+                value=0.5,
+                step=0.1,
+                help="Минимальный интервал времени между position-событиями одной персоны. Повышайте для ускорения и уменьшения events.parquet.",
+            )
+            pro_settings["reid_frames_max_points_per_person"] = st.number_input(
+                "ReID frames: max_points_per_person",
+                min_value=50,
+                max_value=20000,
+                value=2000,
+                step=50,
+                help="Жёсткий лимит событий person_position на одну персону.",
+            )
+            pro_settings["reid_frames_max_total_events"] = st.number_input(
+                "ReID frames: max_total_events",
+                min_value=500,
+                max_value=200000,
+                value=20000,
+                step=500,
+                help="Жёсткий лимит всех ReID frame-событий на анализ (защита от раздувания).",
+            )
 
-    llm_choice = st.radio(
-        "LLM",
-        ["Local (llava-v1.6-mistral-7b-hf)", "GigaChat API"],
+    st.subheader("Модели")
+    vision_llm_ui = st.radio(
+        "Анализ кадров (куда уходит трафик изображений)",
+        ["Local LLaVA", "GigaChat API", "Off (только CV)"],
+        index=1,
+    )
+    final_llm_ui = st.radio(
+        "Финальный ответ (текст/агрегация событий)",
+        ["GigaChat API", "Local LLaVA (не рекомендуется)"],
         index=0,
     )
+
     gigachat_api_key = None
-    if llm_choice == "GigaChat API":
+    gigachat_ca_cert_path = None
+    need_gigachat = (vision_llm_ui == "GigaChat API") or (final_llm_ui == "GigaChat API")
+    if need_gigachat:
+        # По умолчанию берём ключ из config/gigachat_keys.json или env,
+        # ручной ввод — только как override.
+        default_key = load_gigachat_default_key()
+        if default_key:
+            st.caption("GigaChat key: найден в config/env (ввод не требуется)")
+            override = st.checkbox("Переопределить ключ вручную", value=False)
+            if override:
+                gigachat_api_key = st.text_input("GigaChat API key (override)", type="password")
+            else:
+                gigachat_api_key = default_key
+        else:
+            st.warning("GigaChat key не найден в config/env — введите вручную")
         gigachat_api_key = st.text_input("GigaChat API key", type="password")
+
+        default_ca = load_gigachat_ca_bundle_file()
+        if default_ca:
+            st.caption(f"CA bundle: найден в config/env ({default_ca})")
+        gigachat_ca_cert_path = st.text_input(
+            "CA bundle path (optional)",
+            value=default_ca or "",
+            help="Путь к файлу корневых сертификатов Минцифры. Если лежит в config/, подхватится автоматически.",
+        ).strip() or None
 
 
 uploaded_files = st.file_uploader(
@@ -127,7 +246,7 @@ if uploaded_files:
 
 user_query = st.text_area(
     "Ваш вопрос по видео",
-    placeholder="Например: 'Сколько раз посетители брали товар с полки №3 между 14:02 и 14:05?'",
+    placeholder="Например: 'Что делают люди в кадре и как они перемещаются во времени?'",
 )
 require_json = st.checkbox("Требуется JSON-ответ", help="Строгий формат JSON для интеграций")
 
@@ -144,15 +263,20 @@ if run_btn:
         progress.progress(int(v * 100))
         stage.info(msg)
 
-    llm_type = "local" if llm_choice.startswith("Local") else "gigachat"
+    vision_llm = "llava_local" if vision_llm_ui == "Local LLaVA" else ("gigachat_api" if vision_llm_ui == "GigaChat API" else "off")
+    final_llm = "gigachat_api" if final_llm_ui == "GigaChat API" else "llava_local"
     state: PipelineState = {
         "video_paths": video_paths,
         "user_query": user_query,
         "ui_mode": ui_mode,
         "pro_settings": pro_settings if ui_mode == "PRO" else {},
         "require_json": bool(require_json),
-        "llm_type": llm_type,
+        "vision_llm": vision_llm,
+        "final_llm": final_llm,
         "gigachat_api_key": gigachat_api_key,
+        "gigachat_ca_cert_path": gigachat_ca_cert_path,
+        "analyze_people": bool(analyze_people),
+        "force_no_visual_analysis": bool(force_no_visual_analysis or vision_llm == "off"),
         "processing_log": [],
     }
 
@@ -189,7 +313,7 @@ if run_btn:
         else:
             st.dataframe(
                 events_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 

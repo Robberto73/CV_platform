@@ -15,7 +15,8 @@ def device():
 
 @pytest.fixture(scope="session")
 def test_image():
-    url = "https://ultralytics.com/images/bus.jpg"
+    # url = "https://ultralytics.com/images/bus.jpg"
+    url = r"C:\User\New\Desktop\CV_platform\dota.jpg"
     response = requests.get(url)
     return Image.open(BytesIO(response.content))
 
@@ -61,3 +62,7 @@ def test_osnet(device, test_image):
         features = model(input_tensor)
     assert features.shape[1] == 512
     print(f"\nOSNet features shape: {features.shape}")
+
+#test_llava()
+test_yolo()
+test_osnet()

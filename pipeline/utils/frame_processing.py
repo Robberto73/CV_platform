@@ -38,10 +38,36 @@ def resize_for_llava(frame_bgr: np.ndarray, size: int = 336) -> Image.Image:
     return pil.resize((size, size))
 
 
+def _fast_frame_fingerprint(frame_bgr: np.ndarray, size: tuple[int, int] = (64, 64)) -> str:
+    """
+    Быстрый fingerprint кадра (вместо JPEG+MD5).
+    Дешево по CPU, достаточно для дедупа/кэша/логов.
+    """
+    try:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, size, interpolation=cv2.INTER_AREA)
+        return hashlib.md5(small.tobytes()).hexdigest()
+    except Exception:
+        # fallback: хоть какой-то стабильный хеш
+        return hashlib.md5(np.ascontiguousarray(frame_bgr).tobytes()).hexdigest()
+
+
 def compute_ssim(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> float:
+    """
+    Раньше: SSIM по полному кадру (очень дорого).
+    Сейчас: быстрый "псевдо-SSIM" на даунскейле:
+      similarity = 1 - mean(absdiff(gray_small))/255
+    Остаётся в шкале [0..1] и совместим с ssim_threshold (0.9 -> почти без изменений).
+    """
     prev = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2GRAY)
     curr = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2GRAY)
-    return float(ssim(prev, curr))
+    # downscale для скорости
+    prev_s = cv2.resize(prev, (160, 90), interpolation=cv2.INTER_AREA)
+    curr_s = cv2.resize(curr, (160, 90), interpolation=cv2.INTER_AREA)
+    diff = cv2.absdiff(prev_s, curr_s)
+    mad = float(np.mean(diff)) / 255.0  # 0..1
+    sim = 1.0 - mad
+    return float(max(0.0, min(1.0, sim)))
 
 
 @dataclass
@@ -160,8 +186,7 @@ def decode_and_select_frames(
                 continue
 
             timestamp_sec = float(idx / fps)
-            jpeg = frame_to_jpeg_bytes(frame)
-            frame_hash = md5_bytes(jpeg)
+            frame_hash = _fast_frame_fingerprint(frame)
 
             if mode == "PRO" and cache_frames and hash_cache is not None:
                 if frame_hash in hash_cache:
