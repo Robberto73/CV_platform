@@ -10,7 +10,7 @@ __pycache__/
 llava-v1.6-mistral-7b-hf/
 
 config/russian_trusted_root_ca*
-config/gigachat_keys*
+config/gigachat_keys.json
 
 Dockerfile
 
