@@ -1,4 +1,5 @@
 .venv/
+venv/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -7,7 +8,11 @@ __pycache__/
 .DS_Store
 .idea/
 llava-v1.6-mistral-7b-hf/
+
 config/russian_trusted_root_ca*
+config/gigachat_keys*
+
+Dockerfile
 
 out/
 .tmp_uploads/
