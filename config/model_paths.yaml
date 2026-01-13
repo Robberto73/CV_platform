@@ -1,0 +1,7 @@
+# Пример конфигурации путей/имен моделей.
+# При необходимости можно переопределять через переменные окружения.
+
+llava_model_id: "llava-hf/llava-v1.6-mistral-7b-hf"
+yolo_model_path: "yolov8x.pt"
+osnet_reid_model: "osnet_x1_0"
+

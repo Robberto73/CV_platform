@@ -1,0 +1,17 @@
+streamlit==1.29.0
+langgraph==0.0.14
+transformers==4.37.0
+ultralytics==8.0.196
+torchreid==1.5.0
+gigachat==0.1.23
+opencv-python==4.8.1.78
+pyarrow==14.0.1
+streamlit-agraph==0.0.45
+numpy==1.26.4
+pandas==2.1.4
+pydantic==2.5.3
+PyYAML==6.0.1
+requests==2.31.0
+tenacity==8.2.3
+pillow==10.2.0
+scikit-image==0.22.0
