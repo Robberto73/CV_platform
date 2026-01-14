@@ -13,6 +13,8 @@ import yaml
 class ModelPaths:
     llava_model_id: str = "llava-v1.6-mistral-7b-hf"
     yolo_model_path: str = "yolov8n.pt"
+    yolo_model_version: str = "auto"
+    yolo_input_size: int = 640
     osnet_reid_model: str = "osnet_x1_0_imagenet.pt"
 
 
@@ -44,12 +46,36 @@ def load_model_paths(config_path: str = os.path.join("config", "model_paths.yaml
     # env overrides (если надо)
     llava = os.getenv("CV_LAVA_MODEL_ID") or data.get("llava_model_id") or ModelPaths.llava_model_id
     yolo = os.getenv("CV_YOLO_MODEL_PATH") or data.get("yolo_model_path") or ModelPaths.yolo_model_path
+    yolo_version = os.getenv("CV_YOLO_VERSION") or data.get("yolo_model_version") or ModelPaths.yolo_model_version
+    yolo_size = int(os.getenv("CV_YOLO_INPUT_SIZE") or data.get("yolo_input_size") or ModelPaths.yolo_input_size)
     osnet = os.getenv("CV_OSNET_REID_MODEL") or data.get("osnet_reid_model") or ModelPaths.osnet_reid_model
     return ModelPaths(
         llava_model_id=str(llava),
         yolo_model_path=str(yolo),
+        yolo_model_version=str(yolo_version),
+        yolo_input_size=int(yolo_size),
         osnet_reid_model=str(osnet),
     )
+
+
+def get_yolo_version_from_path(model_path: str) -> str:
+    """
+    Автоопределение версии YOLO из имени файла модели.
+    """
+    filename = os.path.basename(model_path).lower()
+    if "yolov8" in filename:
+        if "n.pt" in filename or "nano" in filename:
+            return "n"
+        elif "s.pt" in filename or "small" in filename:
+            return "s"
+        elif "m.pt" in filename or "medium" in filename:
+            return "m"
+        elif "l.pt" in filename or "large" in filename:
+            return "l"
+        elif "x.pt" in filename or "xlarge" in filename:
+            return "x"
+    # fallback to n if auto detection fails
+    return "n"
 
 
 def get_available_cv_models() -> list[str]:
@@ -69,6 +95,12 @@ def get_available_cv_models() -> list[str]:
             available.append("reid-osnet")
         except Exception:
             pass
+    # pose estimation
+    try:
+        import mediapipe  # type: ignore  # noqa: F401
+        available.append("pose-estimation")
+    except Exception:
+        pass
     # zone detector пока только как будущий модуль (не считаем доступным без явной конфигурации)
     return available
 

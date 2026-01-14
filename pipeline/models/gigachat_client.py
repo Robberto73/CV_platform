@@ -26,6 +26,13 @@ class GigaChatRetryableError(GigaChatError):
 
 
 class GigaChatClient:
+    """
+    GigaChat API client with image support.
+
+    Rate limiting: Strict 5-second minimum delay between ANY requests (not just retries).
+    Retry settings: 3 attempts with 2-second fixed delay on errors.
+    """
+
     def __init__(
         self,
         credentials: str,
@@ -46,6 +53,20 @@ class GigaChatClient:
         """
         self.credentials = credentials
         self.scope = scope
+        self._last_request_time = 0.0  # Время последнего запроса для соблюдения rate limit
+        self._min_delay_between_requests = 5.0  # Минимум 5 секунд между запросами
+
+    def _ensure_rate_limit_delay(self) -> None:
+        """Обеспечивает минимум 5 секунд между запросами к GigaChat API."""
+        import time
+        current_time = time.time()
+        time_since_last_request = current_time - self._last_request_time
+
+        if time_since_last_request < self._min_delay_between_requests:
+            delay_needed = self._min_delay_between_requests - time_since_last_request
+            time.sleep(delay_needed)
+
+        self._last_request_time = time.time()
         self.base_url = base_url
         self.auth_url = auth_url
         self.model = model
@@ -71,11 +92,14 @@ class GigaChatClient:
 
     @retry(
         retry=retry_if_exception_type((GigaChatRetryableError,)),
-        stop=stop_after_attempt(3),
-        wait=wait_fixed(1),
+        stop=stop_after_attempt(3),  # 3 попытки с фиксированной задержкой 2 секунды
+        wait=wait_fixed(2),
         reraise=True,
     )
     def chat_with_image(self, prompt: str, base64_image: str) -> str:
+        # Обеспечиваем минимум 5 секунд между запросами
+        self._ensure_rate_limit_delay()
+
         try:
             # Официальный путь для передачи изображения в SDK:
             # 1) загрузить файл через /files
@@ -114,11 +138,14 @@ class GigaChatClient:
 
     @retry(
         retry=retry_if_exception_type((GigaChatRetryableError,)),
-        stop=stop_after_attempt(3),
-        wait=wait_fixed(1),
+        stop=stop_after_attempt(3),  # 3 попытки с фиксированной задержкой 2 секунды
+        wait=wait_fixed(2),
         reraise=True,
     )
     def chat_text(self, prompt: str) -> str:
+        # Обеспечиваем минимум 5 секунд между запросами
+        self._ensure_rate_limit_delay()
+
         try:
             chat = Chat(
                 model=self.model,

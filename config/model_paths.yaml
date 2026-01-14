@@ -3,4 +3,6 @@
 
 llava_model_id: "llava-v1.6-mistral-7b-hf"
 yolo_model_path: "yolov8n.pt"
+yolo_model_version: "auto"  # auto, n, s, m, l, x
+yolo_input_size: 640  # размер входного изображения для YOLO
 osnet_reid_model: "osnet_x1_0_imagenet.pt"

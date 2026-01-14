@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any, Callable, Dict, List
@@ -10,13 +11,14 @@ from pipeline.config import (
     load_gigachat_default_key,
     load_model_paths,
 )
-from pipeline.models.cv_models import make_cv_models
+from pipeline.models.cv_models import CVConfig, make_cv_models
 from pipeline.models.gigachat_client import (
     GigaChatError,
     GigaChatPaymentRequired,
     maybe_make_gigachat_client,
 )
 from pipeline.models.llava_handler import LocalLLaVAUnavailable, maybe_make_local_llava
+from pipeline.models.openai_local_client import maybe_make_openai_local_client
 from pipeline.save_results import (
     make_output_dir,
     save_answer,
@@ -56,6 +58,9 @@ def _heuristic_parse(user_query: str, require_json_flag: bool) -> ParseUserReque
         required.append("yolo-person")
     if any(k in q for k in ["кто", "id", "трек", "тот же", "повторно"]):
         required.append("reid-osnet")
+    # Pose estimation для анализа движений рук/ног
+    if any(k in q for k in ["движени", "поза", "жест", "рука", "нога", "танец", "спорт", "действи"]):
+        required.append("pose-estimation")
 
     json_required = require_json_flag or any(
         k in q for k in ["json", "api", "структурированный ответ"]
@@ -72,7 +77,10 @@ def _heuristic_parse(user_query: str, require_json_flag: bool) -> ParseUserReque
 
 
 def parse_user_request(state: PipelineState) -> PipelineState:
-    pr = ProgressReporter(state.get("progress_cb"))
+    pr = ProgressReporter(
+        progress_cb=state.get("progress_cb"),
+        enable_detailed_logging=bool(state.get("enable_detailed_logging", False))
+    )
     pr.progress(0.05, "parse_user_request: анализ запроса")
     pr.log(state, "parse_user_request: start")
 
@@ -143,6 +151,24 @@ def parse_user_request(state: PipelineState) -> PipelineState:
     if bool(state.get("analyze_people", False)) and "yolo-person" in available_cv:
         if "yolo-person" not in state["required_models"]:
             state["required_models"].insert(0, "yolo-person")
+            # Автоматически подключаем ReID для точности на Linux
+            import platform
+            if platform.system().lower() == "linux" and "reid-osnet" in available_cv:
+                if "reid-osnet" not in state["required_models"]:
+                    state["required_models"].append("reid-osnet")
+                    pr.log(state, "parse_user_request: auto-enabled ReID for Linux + yolo-person")
+
+    # ReID для сохранения уникальных людей (даже в CV-only режиме)
+    if bool(state.get("save_unique_people", False)) and "reid-osnet" in available_cv:
+        if "reid-osnet" not in state["required_models"]:
+            state["required_models"].append("reid-osnet")
+            pr.log(state, "parse_user_request: enabled ReID for unique people saving")
+
+    # Pose estimation
+    if bool(state.get("analyze_pose", False)) and "pose-estimation" in available_cv:
+        if "pose-estimation" not in state["required_models"]:
+            state["required_models"].append("pose-estimation")
+            pr.log(state, "parse_user_request: enabled pose estimation")
     pr.log(state, f"parse_user_request: available_cv_models={available_cv}")
     pr.log(state, f"parse_user_request: required_models={state['required_models']}")
     pr.log(state, f"parse_user_request: require_visual_analysis={state['require_visual_analysis']}")
@@ -152,7 +178,10 @@ def parse_user_request(state: PipelineState) -> PipelineState:
 
 
 def select_video_analysis_mode(state: PipelineState) -> PipelineState:
-    pr = ProgressReporter(state.get("progress_cb"))
+    pr = ProgressReporter(
+        progress_cb=state.get("progress_cb"),
+        enable_detailed_logging=bool(state.get("enable_detailed_logging", False))
+    )
     pr.progress(0.2, "select_video_analysis_mode: выбор режима анализа")
     pr.log(state, "select_video_analysis_mode: start")
 
@@ -169,11 +198,21 @@ def select_video_analysis_mode(state: PipelineState) -> PipelineState:
 
 
 def prepare_key_frames(state: PipelineState) -> PipelineState:
-    pr = ProgressReporter(state.get("progress_cb"))
+    if state.get("is_image_mode", False):
+        return prepare_key_images(state)
+
+    pr = ProgressReporter(
+        progress_cb=state.get("progress_cb"),
+        enable_detailed_logging=bool(state.get("enable_detailed_logging", False))
+    )
     pr.progress(0.3, "prepare_key_frames: выборка кадров и CV-контекст")
     pr.log(state, "prepare_key_frames: start")
 
-    cv = make_cv_models()
+    yolo_batch_size = int(state.get("yolo_batch_size", 16))
+    cv = make_cv_models(
+        pro_settings=state.get("pro_settings") if state.get("ui_mode") == "PRO" else None,
+        yolo_batch_size=yolo_batch_size
+    )
     required_models = state.get("required_models", []) or []
 
     if state.get("ui_mode") == "PRO":
@@ -194,20 +233,72 @@ def prepare_key_frames(state: PipelineState) -> PipelineState:
     cache_path = os.path.join(state["output_dir"], "cache", "frame_hashes.pkl")
     hash_cache = load_frame_hashes(cache_path) or FrameHashCache(maxsize=1000)
 
+    # Проверка на умную кластеризацию
+    smart_clustering_enabled = (
+        state.get("ui_mode") == "PRO" and
+        state.get("pro_settings", {}).get("enable_smart_clustering", False)
+    )
+
+    if smart_clustering_enabled:
+        pr.log(state, "prepare_key_frames: включена умная кластеризация видео")
+        from pipeline.utils.video_clustering import smart_video_clustering, VideoClusterConfig
+
+        ps = state.get("pro_settings", {})
+        cluster_config = VideoClusterConfig(
+            ssi_threshold=float(ps.get("clustering_ssi_threshold", 0.85)),
+            window_duration_sec=int(ps.get("clustering_window_duration", 300)),
+            base_sample_rate=0.5  # Фиксированная частота 0.5 (каждые 2 сек)
+        )
+
     key_frames: Dict[str, List[Dict[str, Any]]] = {}
     for i, vp in enumerate(state.get("video_paths", []) or []):
         cv.begin_video()
         pr.progress(0.3 + 0.4 * (i / max(1, len(state.get("video_paths", []) or []))), f"prepare_key_frames: {os.path.basename(vp)}")
         mode = state.get("ui_mode", "STANDARD")
-        t_decode0 = time.perf_counter()
-        frames = decode_and_select_frames(
-            video_path=vp,
-            frame_sampling_rate=float(cfg.frame_sampling_rate),
-            mode=mode,
-            ssim_threshold=float(cfg.ssim_threshold),
-            skip_static_frames=bool(cfg.skip_static_frames),
-            cache_frames=bool(cfg.cache_frames),
-            hash_cache=hash_cache if mode == "PRO" and cfg.cache_frames else None,
+
+        if smart_clustering_enabled:
+            # Умная кластеризация вместо стандартной выборки
+            pr.log(state, f"prepare_key_frames: запускаем умную кластеризацию для {os.path.basename(vp)}")
+            t_cluster0 = time.perf_counter()
+            clustering_result = smart_video_clustering(
+                video_path=vp,
+                output_dir=state["output_dir"],
+                ssi_threshold=cluster_config.ssi_threshold,
+                window_duration=cluster_config.window_duration_sec
+            )
+            t_cluster = time.perf_counter() - t_cluster0
+
+            # Конвертация результатов кластеризации в формат key_frames
+            selected_frames = []
+            for kf in clustering_result['key_frames']:
+                # Создаем frame_meta как в стандартной обработке
+                frame_meta = {
+                    "frame_id": int(kf['timestamp'] * 30),  # Примерный frame_id
+                    "timestamp_sec": kf['timestamp'],
+                    "frame_bgr": kf['frame'],
+                    "cv_context": [],  # CV контекст будет добавлен ниже
+                    "cluster_info": {
+                        "size": kf['cluster_size'],
+                        "duration": kf['cluster_duration']
+                    }
+                }
+                selected_frames.append(frame_meta)
+
+            frames = selected_frames
+            pr.log(state, f"prepare_key_frames: умная кластеризация выбрала {len(frames)} ключевых кадров за {t_cluster:.2f}s")
+            pr.log(state, f"prepare_key_frames: статистика кластеризации: {clustering_result['processing_stats']}")
+
+        else:
+            # Стандартная выборка кадров
+            t_decode0 = time.perf_counter()
+            frames = decode_and_select_frames(
+                video_path=vp,
+                frame_sampling_rate=float(cfg.frame_sampling_rate),
+                mode=mode,
+                ssim_threshold=float(cfg.ssim_threshold),
+                skip_static_frames=bool(cfg.skip_static_frames),
+                cache_frames=bool(cfg.cache_frames),
+                hash_cache=hash_cache if mode == "PRO" and cfg.cache_frames else None,
             keep_hook=keep_hook,
             # CV-only не должен "обрубать" видео до 4–5 секунд.
             # 60 кадров при 1 кадр/сек покрывают короткие видео и защищают от runaway на очень длинных.
@@ -245,9 +336,10 @@ def prepare_key_frames(state: PipelineState) -> PipelineState:
                     timestamp_sec=float(f["timestamp_sec"]),
                     video_path=vp,
                 )
-            # сохраняем кадр на диск в out/cache/frames (только если PRO+cache_frames)
+            # сохраняем кадр на диск в out/cache/frames (только если PRO+cache_frames и НЕ сохраняем уникальных людей)
             frame_file = None
-            if state.get("ui_mode") == "PRO" and cfg.cache_frames:
+            save_general_frames = cfg.cache_frames and not state.get("save_unique_people", False)
+            if state.get("ui_mode") == "PRO" and save_general_frames:
                 frames_dir = os.path.join(state["output_dir"], "cache", "frames")
                 os.makedirs(frames_dir, exist_ok=True)
                 frame_file = os.path.join(frames_dir, f"{os.path.basename(vp)}_{f['frame_id']}.jpg")
@@ -280,7 +372,8 @@ def prepare_key_frames(state: PipelineState) -> PipelineState:
                 state["person_routes"] = routes
 
     state["key_frames"] = key_frames
-    if state.get("ui_mode") == "PRO" and cfg.cache_frames:
+    save_general_frames = cfg.cache_frames and not state.get("save_unique_people", False)
+    if state.get("ui_mode") == "PRO" and save_general_frames:
         save_frame_hashes(cache_path, hash_cache)
 
     # Всегда формируем CV-события из cv_context (это даёт полезные events даже если LLM не сработал/без vision)
@@ -334,6 +427,11 @@ def prepare_key_frames(state: PipelineState) -> PipelineState:
         set((state.get("models_used") or []) + (state.get("required_models") or []))
     )
 
+    # Сохраняем полные ReID данные для сохранения уникальных людей
+    if cv._reid_tracker is not None:
+        state["reid_trajectories"] = cv._reid_tracker._traj.copy()
+        state["reid_global_db"] = cv._reid_tracker._global_db.copy()
+
     # CV-only: ничего больше не делаем, LLM этап пропустит сам себя
     if not bool(state.get("require_visual_analysis", True)):
         pr.log(state, "prepare_key_frames: CV-only mode -> events from CV only")
@@ -343,8 +441,119 @@ def prepare_key_frames(state: PipelineState) -> PipelineState:
     return state
 
 
+def prepare_key_images(state: PipelineState) -> PipelineState:
+    """Обработка изображений: детекция объектов и анализ"""
+    pr = ProgressReporter(
+        progress_cb=state.get("progress_cb"),
+        enable_detailed_logging=bool(state.get("enable_detailed_logging", False))
+    )
+    pr.progress(0.3, "prepare_key_images: анализ изображений и CV-контекст")
+    pr.log(state, "prepare_key_images: start")
+
+    image_paths = state.get("image_paths", []) or []
+    if not image_paths:
+        pr.log(state, "prepare_key_images: no images provided")
+        return state
+
+    # Загружаем настройки
+    pro_settings = state.get("pro_settings", {})
+    cfg = CVConfig(
+        yolo_model_path=state.get("yolo_model_path", "yolov8n.pt"),
+        yolo_model_version=state.get("yolo_model_version", "auto"),
+        yolo_input_size=state.get("yolo_input_size", 640),
+        conf_threshold=float(state.get("conf_threshold", 0.5)),
+        batch_size=int(pro_settings.get("yolo_batch_size", 8)),
+        osnet_reid_model_path=state.get("osnet_reid_model_path", "osnet_x1_0_imagenet.pt"),
+        pro_yolo_input_size=pro_settings.get("yolo_input_size"),
+        pro_yolo_conf_threshold=pro_settings.get("yolo_conf_threshold"),
+    )
+
+    # Создаем CV модели
+    cv = make_cv_models(cfg, pro_settings, yolo_batch_size=int(pro_settings.get("yolo_batch_size", 8)))
+
+    key_images: Dict[str, List[Dict[str, Any]]] = {}
+    events = []
+
+    for i, img_path in enumerate(image_paths):
+        pr.progress(0.3 + 0.4 * (i / max(1, len(image_paths))), f"prepare_key_images: {os.path.basename(img_path)}")
+
+        # Загружаем изображение
+        frame_bgr = cv2.imread(img_path)
+        if frame_bgr is None:
+            pr.log(state, f"prepare_key_images: failed to load image {img_path}")
+            continue
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        height, width = frame_rgb.shape[:2]
+
+        # Детекция объектов на изображении
+        detections = cv.detect_objects(frame_rgb)
+
+        # Создаем "кадр" для каждого изображения
+        image_frame = {
+            "frame_id": 0,  # Для изображений всегда frame_id = 0
+            "timestamp": 0.0,  # Для изображений timestamp = 0.0
+            "image_path": img_path,
+            "width": width,
+            "height": height,
+            "detections": detections,
+        }
+
+        key_images[img_path] = [image_frame]
+
+        # Создаем события для каждого обнаруженного объекта
+        for det in detections:
+            event = {
+                "video_path": img_path,  # Используем image_path как video_path для совместимости
+                "frame_id": 0,
+                "timestamp": 0.0,
+                "class": det.get("class", "unknown"),
+                "confidence": det.get("confidence", 0.0),
+                "bbox": det.get("bbox", []),
+                "bbox_xyxy": det.get("bbox_xyxy", []),
+                "area": det.get("area", 0),
+                "event_type": "object_detection",
+                "description": f"Обнаружен объект '{det.get('class', 'unknown')}' с уверенностью {det.get('confidence', 0.0):.2f}",
+            }
+            events.append(event)
+
+        # Если включен анализ людей, добавляем дополнительные события
+        if state.get("analyze_people", False) and cv._reid_tracker:
+            # Для изображений ReID работает как обычная детекция людей
+            person_detections = [d for d in detections if d.get("class") == "person"]
+            for person_det in person_detections:
+                person_event = {
+                    "video_path": img_path,
+                    "frame_id": 0,
+                    "timestamp": 0.0,
+                    "class": "person",
+                    "confidence": person_det.get("confidence", 0.0),
+                    "bbox": person_det.get("bbox", []),
+                    "bbox_xyxy": person_det.get("bbox_xyxy", []),
+                    "area": person_det.get("area", 0),
+                    "person_id": f"person_{len(events)}",  # Простая нумерация для изображений
+                    "event_type": "person_detection",
+                    "description": f"Обнаружен человек с уверенностью {person_det.get('confidence', 0.0):.2f}",
+                }
+                events.append(person_event)
+
+    state["key_frames"] = key_images  # Для совместимости используем key_frames
+    state["key_images"] = key_images   # И добавляем key_images для ясности
+    state["events"] = events
+
+    pr.log(state, f"prepare_key_images: total_images={len(key_images)} total_events={len(events)}")
+    pr.progress(0.55, "prepare_key_images: готово")
+    return state
+
+
 def run_llava_analysis(state: PipelineState) -> PipelineState:
-    pr = ProgressReporter(state.get("progress_cb"))
+    import time
+    analysis_start = time.time()
+
+    pr = ProgressReporter(
+        progress_cb=state.get("progress_cb"),
+        enable_detailed_logging=bool(state.get("enable_detailed_logging", False))
+    )
     pr.progress(0.6, "run_llava_analysis: мультимодальный анализ кадров")
     pr.log(state, "run_llava_analysis: start")
 
@@ -355,8 +564,17 @@ def run_llava_analysis(state: PipelineState) -> PipelineState:
         return state
 
     vision_llm = state.get("vision_llm", "llava_local")
+
+    # Автоматическое переключение на Local LLaVA для изображений если выбрана GigaChat
+    # GigaChat не поддерживает изображения, поэтому переключаемся на Local LLaVA
+    if vision_llm == "gigachat_api" and state.get("is_image_mode", False):
+        pr.log(state, "run_llava_analysis: switching from GigaChat to Local LLaVA for image analysis (GigaChat doesn't support images)")
+        vision_llm = "llava_local"
+
     require_json = bool(state.get("require_json", False))
     user_query = state.get("user_query", "")
+    openai_batch_size = int(state.get("openai_batch_size", 8))
+    llava_image_size = int(state.get("llava_image_size", 336))  # Размер изображений для LLaVA из PRO настроек
     results: list[dict[str, Any]] = list(state.get("llava_results") or [])
     events: list[dict[str, Any]] = list(state.get("events") or [])
     models_used: list[str] = []
@@ -367,20 +585,21 @@ def run_llava_analysis(state: PipelineState) -> PipelineState:
     state["gigachat_api_key"] = api_key
     ca_bundle = state.get("gigachat_ca_cert_path") or load_gigachat_ca_bundle_file()
     gigachat = maybe_make_gigachat_client(api_key, ca_bundle_file=ca_bundle)
+    openai_local = maybe_make_openai_local_client()
 
     def analyze_one(frame_meta: dict[str, Any]) -> str:
         cv_ctx = frame_meta.get("cv_context", [])
-        prompt = (
-            "Ты — эксперт по анализу видео. Проанализируй прикрепленный кадр и ответь на вопрос пользователя.\n"
-            f"Контекст от вспомогательных CV-моделей:\n{cv_ctx}\n\n"
-            f"Вопрос пользователя:\n'{user_query}'\n\n"
-            "Инструкции:\n"
-            "- Всегда отвечай на русском языке.\n"
-            "- Если в вопросе требуется ответ в формате JSON или активирован флаг json_required, верни ТОЛЬКО JSON без дополнительного текста.\n"
-            "- Иначе ответь кратко и по делу.\n"
-            "- Укажи уровень уверенности в ответе (0.0-1.0).\n"
-            "- Если кадр не содержит релевантной информации, ответь 'no_relevant_info'.\n"
-        )
+            prompt = (
+                "You are a video analysis expert. Analyze the attached frame and answer the user's question.\n"
+                f"Context from auxiliary CV models:\n{cv_ctx}\n\n"
+                f"User question:\n'{user_query}'\n\n"
+                "Instructions:\n"
+                "- Always answer in Russian language.\n"
+                "- If the question requires a JSON format answer or json_required flag is activated, return ONLY JSON without additional text.\n"
+                "- Otherwise, answer briefly and to the point.\n"
+                "- Indicate the confidence level in the answer (0.0-1.0).\n"
+                "- If the frame contains no relevant information, answer 'no_relevant_info'.\n"
+            )
 
         image = resize_for_llava(frame_meta["frame_bgr"])
 
@@ -410,6 +629,17 @@ def run_llava_analysis(state: PipelineState) -> PipelineState:
             except Exception as ge:
                 pr.log(state, f"run_llava_analysis: gigachat image call failed: {ge}")
                 return "no_relevant_info"
+        elif vision_llm == "openai_local":
+            if openai_local is None:
+                pr.log(state, "run_llava_analysis: openai local unavailable")
+                return "no_relevant_info"
+            models_used.append("openai-local")
+            b64 = pil_to_base64_jpeg(image)
+            try:
+                return openai_local.analyze_image(b64, prompt)
+            except Exception as oe:
+                pr.log(state, f"run_llava_analysis: openai local image call failed: {oe}")
+                return "no_relevant_info"
         else:
             return "no_relevant_info"
 
@@ -420,12 +650,103 @@ def run_llava_analysis(state: PipelineState) -> PipelineState:
             all_frames.append((vp, f))
 
     total = max(1, len(all_frames))
-    gigachat_blocked = False
-    for i, (vp, f) in enumerate(all_frames):
-        if gigachat_blocked or bool(state.get("_gigachat_blocked", False)):
-            break
-        pr.progress(0.6 + 0.25 * (i / total), f"run_llava_analysis: кадр {i+1}/{total}")
-        raw = analyze_one(f)
+
+    if vision_llm == "openai_local" and openai_local is not None:
+        # Батчевая обработка для OpenAI Local
+        pr.progress(0.6, f"run_llava_analysis: подготовка батчей (batch_size={openai_batch_size})")
+        batch_size = openai_batch_size  # используем настройку из UI
+
+        # Подготовка данных для батчинга
+        image_prompts = []
+        frame_indices = []
+
+        for i, (vp, f) in enumerate(all_frames):
+            cv_ctx = f.get("cv_context", [])
+            # Сначала проверим работу модели простым английским prompt
+            if user_query.lower().strip() == "test":
+                prompt = f"What do you see in this image? Context: {cv_ctx}"
+            else:
+                prompt = (
+                    "You are a video analysis expert. Analyze the attached frame and answer the user's question.\n"
+                    f"Context from auxiliary CV models:\n{cv_ctx}\n\n"
+                    f"User question:\n'{user_query}'\n\n"
+                    "Instructions:\n"
+                    "- Always answer in Russian language.\n"
+                    "- If the question requires a JSON format answer or json_required flag is activated, return ONLY JSON without additional text.\n"
+                    "- Otherwise, answer briefly and to the point.\n"
+                    "- Indicate the confidence level in the answer (0.0-1.0).\n"
+                    "- If the frame contains no relevant information, answer 'no_relevant_info'.\n"
+                )
+
+            image = resize_for_llava(f["frame_bgr"], size=llava_image_size)
+            b64 = pil_to_base64_jpeg(image)
+            image_prompts.append({"image_base64": b64, "prompt": prompt})
+            frame_indices.append(i)
+
+        # Батчевая обработка
+        pr.progress(0.65, f"run_llava_analysis: обработка батчей (размер: {openai_batch_size})")
+        import time
+        vllm_start = time.time()
+        try:
+            batch_results = openai_local.batch_analyze_images(image_prompts, batch_size=openai_batch_size)
+            vllm_time = time.time() - vllm_start
+            pr.log(state, f"run_llava_analysis: vLLM processed {len(batch_results)} images in {vllm_time:.2f}s ({vllm_time/max(1, len(batch_results)):.2f}s per image)")
+            models_used.append("openai-local")
+        except Exception as e:
+            pr.log(state, f"run_llava_analysis: batch processing failed: {e}")
+            batch_results = ["no_relevant_info"] * len(image_prompts)
+
+        # Обработка результатов батча
+        for i, raw in enumerate(batch_results):
+            frame_idx = frame_indices[i]
+            vp, f = all_frames[frame_idx]
+
+            pr.progress(0.7 + 0.2 * (i / len(batch_results)), f"run_llava_analysis: кадр {i+1}/{len(batch_results)}")
+
+            parsed_frame: FrameLLMAnswer
+            if require_json:
+                obj = extract_first_json(raw) or {"answer": "no_relevant_info", "confidence": 0.0, "event_type": None}
+                try:
+                    parsed_frame = FrameLLMAnswer.model_validate(obj)
+                except Exception:
+                    parsed_frame = FrameLLMAnswer(answer="no_relevant_info", confidence=0.0, event_type=None)
+            else:
+                parsed_frame = FrameLLMAnswer(answer=str(raw).strip(), confidence=0.5, event_type=None)
+
+            results.append(
+                {
+                    "video_path": vp,
+                    "frame_id": int(f["frame_id"]),
+                    "timestamp_sec": float(f["timestamp_sec"]),
+                    "answer_raw": raw,
+                    "answer_parsed": parsed_frame.model_dump(),
+                }
+            )
+
+            # events
+            if parsed_frame.answer and parsed_frame.answer.strip() != "no_relevant_info":
+                event_type = parsed_frame.event_type or "llm_observation"
+                ev = Event(
+                    event_id=f"{os.path.basename(vp)}_{float(f['timestamp_sec']):.1f}_{event_type}",
+                    video_path=vp,
+                    timestamp_sec=float(f["timestamp_sec"]),
+                    frame_id=int(f["frame_id"]),
+                    event_type=event_type,
+                    entities=[],
+                    llava_analysis=parsed_frame.answer,
+                    confidence=parsed_frame.confidence,
+                    source_frames=[int(f["frame_id"])],
+                )
+                events.append(ev.model_dump(by_alias=True))
+
+    else:
+        # Обычная обработка по кадрам (для других LLM)
+        gigachat_blocked = False
+        for i, (vp, f) in enumerate(all_frames):
+            if gigachat_blocked or bool(state.get("_gigachat_blocked", False)):
+                break
+            pr.progress(0.6 + 0.25 * (i / total), f"run_llava_analysis: кадр {i+1}/{total}")
+            raw = analyze_one(f)
 
         parsed_frame: FrameLLMAnswer
         if require_json:
@@ -470,13 +791,18 @@ def run_llava_analysis(state: PipelineState) -> PipelineState:
     state["llava_results"] = results
     state["events"] = events
     state["models_used"] = sorted(set((state.get("models_used") or []) + models_used))
-    pr.log(state, f"run_llava_analysis: events={len(events)}")
+
+    total_analysis_time = time.time() - analysis_start
+    pr.log(state, f"run_llava_analysis: events={len(events)}, total_time={total_analysis_time:.2f}s")
     pr.progress(0.85, "run_llava_analysis: готово")
     return state
 
 
 def generate_final_answer(state: PipelineState) -> PipelineState:
-    pr = ProgressReporter(state.get("progress_cb"))
+    pr = ProgressReporter(
+        progress_cb=state.get("progress_cb"),
+        enable_detailed_logging=bool(state.get("enable_detailed_logging", False))
+    )
     pr.progress(0.88, "generate_final_answer: агрегирование и финальный ответ")
     pr.log(state, "generate_final_answer: start")
 
@@ -484,32 +810,114 @@ def generate_final_answer(state: PipelineState) -> PipelineState:
     events = state.get("events", []) or []
     user_query = state.get("user_query", "")
     models_used = state.get("models_used", []) or []
+    video_paths = state.get("video_paths", []) or []
+    summarization_mode = state.get("summarization_mode", "Баланс (умолчание)")
+    custom_max_chunks = state.get("custom_max_chunks", 8)
+    custom_max_evidence = state.get("custom_max_evidence", 5)
 
     # Универсальная предсуммаризация для длинных данных (без привязки к объектам)
+    import time
+    start_time = time.time()
     sum_cfg = SummarizationConfig()
     summary = summarize_events_algorithmic(events, sum_cfg)
+    summarization_time = time.time() - start_time
+    pr.log(state, f"generate_final_answer: summarization took {summarization_time:.2f}s for {len(events)} events")
     state["events_summary"] = summary
     evidence = build_query_evidence(events, summary, max_evidence_events=sum_cfg.max_evidence_events)
     state["query_evidence"] = evidence
     # Для LLM не отправляем покадровые/посекундные списки — это провоцирует такой же ответ.
     # Дадим компактную агрегированную сводку по чанкам + несколько доказательств.
-    def _compact_summary_for_llm(s: dict[str, Any], max_chunks: int = 8) -> str:
+    def _adaptive_summary_for_llm(
+        s: dict[str, Any],
+        video_duration_sec: float,
+        summarization_mode: str = "Баланс (умолчание)",
+        custom_max_chunks: int = 8,
+        custom_max_evidence: int = 5
+    ) -> str:
+        """Адаптивная суммаризация в зависимости от режима и длины видео"""
         chunks = (s.get("chunks") or []) if isinstance(s, dict) else []
+
+        # Определение лимитов в зависимости от режима и длины видео
+        if summarization_mode == "Баланс (умолчание)":
+            # Адаптивные лимиты по умолчанию
+            if video_duration_sec < 60:  # < 1 мин
+                max_chunks = 6
+            elif video_duration_sec < 300:  # 1-5 мин
+                max_chunks = 8
+            elif video_duration_sec < 900:  # 5-15 мин
+                max_chunks = 10
+            else:  # > 15 мин
+                max_chunks = 6
+        elif summarization_mode == "Детальный (больше чанков)":
+            max_chunks = max(custom_max_chunks, 12)
+        elif summarization_mode == "Компактный (меньше чанков)":
+            max_chunks = min(custom_max_chunks, 6)  # Изменено с 4 на 6 для менее агрессивного сокращения
+        else:  # Стандартный (адаптивный)
+            max_chunks = custom_max_chunks
+
         lines: list[str] = []
         # НЕ передаём длительность/FPS/разрешение и прочие "характеристики видео" в LLM:
         # это часто попадает в ответ даже если вопрос не про это.
-        lines.append(f"chunks={len(chunks)}")
-        for c in chunks[: int(max_chunks)]:
+        lines.append(f"chunks={len(chunks)} (показано {min(len(chunks), max_chunks)})")
+
+        # Группировка чанков по временным окнам для лучшей компактности
+        time_windows = {}
+        for c in chunks[:max_chunks]:
             try:
-                lines.append(
-                    f"- {c.get('start','?')}–{c.get('end','?')}: events={int(c.get('events_count', 0))}"
-                )
+                start_time = float(c.get('start', 0))
+                window_key = int(start_time // 30) * 30  # 30-секундные окна
+                if window_key not in time_windows:
+                    time_windows[window_key] = []
+                time_windows[window_key].append(c)
             except Exception:
                 continue
+
+        # Суммирование по окнам
+        for window_start in sorted(time_windows.keys()):
+            window_chunks = time_windows[window_start]
+            total_events = sum(int(c.get('events_count', 0)) for c in window_chunks)
+            start_times = [c.get('start', '?') for c in window_chunks]
+            end_times = [c.get('end', '?') for c in window_chunks]
+
+            lines.append(
+                f"- {min(start_times)}–{max(end_times)}: events={total_events} (чанков: {len(window_chunks)})"
+            )
+
         return "\n".join(lines)
 
-    def _format_evidence_for_llm(ev: dict[str, Any], max_items: int = 5, max_text_chars: int = 200) -> str:
+    def _adaptive_evidence_for_llm(
+        ev: dict[str, Any],
+        video_duration_sec: float,
+        summarization_mode: str = "Баланс (умолчание)",
+        custom_max_evidence: int = 5
+    ) -> str:
+        """Адаптивное форматирование доказательств"""
         items = (ev.get("evidence") or []) if isinstance(ev, dict) else []
+
+        # Определение лимитов в зависимости от режима
+        if summarization_mode == "Баланс (умолчание)":
+            if video_duration_sec < 60:  # < 1 мин
+                max_items = 4
+                max_text_chars = 150
+            elif video_duration_sec < 300:  # 1-5 мин
+                max_items = 5
+                max_text_chars = 200
+            elif video_duration_sec < 900:  # 5-15 мин
+                max_items = 6
+                max_text_chars = 180
+            else:  # > 15 мин
+                max_items = 4
+                max_text_chars = 150
+        elif summarization_mode == "Детальный (больше чанков)":
+            max_items = max(custom_max_evidence, 8)
+            max_text_chars = 250
+        elif summarization_mode == "Компактный (меньше чанков)":
+            max_items = min(custom_max_evidence, 3)
+            max_text_chars = 120
+        else:  # Стандартный (адаптивный)
+            max_items = custom_max_evidence
+            max_text_chars = 200
+
         out: list[str] = []
         for it in items[: int(max_items)]:
             try:
@@ -522,10 +930,20 @@ def generate_final_answer(state: PipelineState) -> PipelineState:
                 out.append(f"- {t} {et} id={eid}: {txt}")
             except Exception:
                 continue
-        return "\n".join(out) if out else "(нет)"
+        return "\n".join(out) if out else "(нет доказательств)"
 
-    summary_text = _compact_summary_for_llm(summary)
-    evidence_text = _format_evidence_for_llm(evidence)
+    # Определение общей длительности видео для адаптивной суммаризации
+    video_duration_sec = 0
+    if events:
+        max_timestamp = max((ev.get("timestamp_sec", 0) for ev in events), default=0)
+        video_duration_sec = max_timestamp
+
+    summary_text = _adaptive_summary_for_llm(
+        summary, video_duration_sec, summarization_mode, custom_max_chunks, custom_max_evidence
+    )
+    evidence_text = _adaptive_evidence_for_llm(
+        evidence, video_duration_sec, summarization_mode, custom_max_evidence
+    )
 
     # Финальный ответ: предпочитаем GigaChat (текст), т.к. Local LLaVA в проекте используется в основном как vision.
     final: Any
@@ -598,6 +1016,112 @@ def generate_final_answer(state: PipelineState) -> PipelineState:
             except Exception as e:
                 pr.log(state, f"generate_final_answer: gigachat failed: {e}")
 
+    elif state.get("final_llm") == "openai_local":
+        client = maybe_make_openai_local_client()
+        if client is not None:
+            json_schema = {
+                "answer": "Основной ответ на вопрос",
+                "details": [
+                    {
+                        "time": "ЧЧ:ММ:СС",
+                        "description": "Описание события",
+                        "confidence": 0.0,
+                        "source_event_id": "event_id",
+                    }
+                ],
+                "confidence": 0.0,
+                "processing_time_sec": 0.0,
+                "models_used": ["llava-v1.6", "yolov8-person", "reid-osnet"],
+            }
+            prompt = (
+                "На основе событий из видео ответь на исходный вопрос пользователя.\n"
+                "Ниже дана КОМПАКТНАЯ агрегированная сводка (без покадрового списка) и небольшой набор доказательств.\n"
+                "Твоя задача — дать ИТОГОВЫЙ ответ по смыслу (универсально), НЕ переписывая входные строки и НЕ перечисляя события по секундам/кадрам.\n"
+                "Фокус: люди, действия, перемещения и взаимодействия с окружением — только если это уместно для вопроса.\n\n"
+                f"Сводка (агрегировано):\n{summary_text}\n\n"
+                f"Доказательства (можно ссылаться на event_id):\n{evidence_text}\n\n"
+                f"Вопрос:\n'{user_query}'\n\n"
+                "Формат ответа (если требуется JSON) — строго следовать этой схеме:\n"
+                f"{json.dumps(json_schema, ensure_ascii=False, indent=2)}\n\n"
+                "Инструкции:\n"
+                "- Всегда отвечай на русском языке.\n"
+                "- Если требуется JSON — верни ТОЛЬКО валидный JSON без дополнительного текста.\n"
+                "- Иначе ответь кратко и по делу.\n"
+                "- Укажи уровень уверенности в ответе (0.0-1.0).\n"
+                "- Фокус на ключевых моментах, а не на перечислении каждого события.\n"
+                "- Если данных недостаточно — явно скажи что именно не видно/чего не хватает.\n"
+                "- Где уместно, укажи источники через event_id (не больше 5 ссылок).\n"
+                "- В конце добавь раздел 'confidence_analysis' с оценкой надежности данных.\n"
+                "- Если часть описаний событий на английском — переведи на русский.\n"
+            )
+            state["final_prompt"] = prompt
+            try:
+                txt = client.chat_text(prompt)
+                if require_json:
+                    obj = extract_first_json(txt)
+                    if obj:
+                        obj["models_used"] = models_used
+                        final = obj
+                    else:
+                        final["answer"] = txt
+                else:
+                    final = txt
+            except Exception as e:
+                pr.log(state, f"generate_final_answer: openai local failed: {e}")
+
+    elif state.get("final_llm") == "llava_local":
+        client = maybe_make_local_llava(mp.llava_model_id)
+        if client is not None:
+            json_schema = {
+                "answer": "Основной ответ на вопрос",
+                "details": [
+                    {
+                        "time": "ЧЧ:ММ:СС",
+                        "description": "Описание события",
+                        "confidence": 0.0,
+                        "source_event_id": "event_id",
+                    }
+                ],
+                "confidence": 0.0,
+                "processing_time_sec": 0.0,
+                "models_used": ["llava-v1.6", "yolov8-person", "reid-osnet"],
+            }
+            prompt = (
+                "На основе событий из видео ответь на исходный вопрос пользователя.\n"
+                "Ниже дана КОМПАКТНАЯ агрегированная сводка (без покадрового списка) и небольшой набор доказательств.\n"
+                "Твоя задача — дать ИТОГОВЫЙ ответ по смыслу (универсально), НЕ переписывая входные строки и НЕ перечисляя события по секундам/кадрам.\n"
+                "Фокус: люди, действия, перемещения и взаимодействия с окружением — только если это уместно для вопроса.\n\n"
+                f"Сводка (агрегировано):\n{summary_text}\n\n"
+                f"Доказательства (можно ссылаться на event_id):\n{evidence_text}\n\n"
+                f"Вопрос:\n'{user_query}'\n\n"
+                "Формат ответа (если требуется JSON) — строго следовать этой схеме:\n"
+                f"{json.dumps(json_schema, ensure_ascii=False, indent=2)}\n\n"
+                "Инструкции:\n"
+                "- Всегда отвечай на русском языке.\n"
+                "- Если требуется JSON — верни ТОЛЬКО валидный JSON без дополнительного текста.\n"
+                "- Иначе ответь кратко и по делу.\n"
+                "- Укажи уровень уверенности в ответе (0.0-1.0).\n"
+                "- Фокус на ключевых моментах, а не на перечислении каждого события.\n"
+                "- Если данных недостаточно — явно скажи что именно не видно/чего не хватает.\n"
+                "- Где уместно, укажи источники через event_id (не больше 5 ссылок).\n"
+                "- В конце добавь раздел 'confidence_analysis' с оценкой надежности данных.\n"
+                "- Если часть описаний событий на английском — переведи на русский.\n"
+            )
+            state["final_prompt"] = prompt
+            try:
+                txt = client.chat_text(prompt)
+                if require_json:
+                    obj = extract_first_json(txt)
+                    if obj:
+                        obj["models_used"] = models_used
+                        final = obj
+                    else:
+                        final["answer"] = txt
+                else:
+                    final = txt
+            except Exception as e:
+                pr.log(state, f"generate_final_answer: llava local failed: {e}")
+
     # Safety: если LLM всё равно вернул покадровый список, ужимаем до итоговой сводки.
     if not require_json and isinstance(final, str) and final:
         # эвристика: слишком много строк с таймкодами вида **00:00:01**
@@ -617,25 +1141,105 @@ def generate_final_answer(state: PipelineState) -> PipelineState:
 
     # Heuristic fallback
     if require_json and (not final or not isinstance(final, dict) or not final.get("answer")):
-        note = ""
-        if state.get("error_code") == "GIGACHAT_PAYMENT_REQUIRED":
-            note = " (GigaChat недоступен: 402 Payment Required)"
-        final["answer"] = (
-            "Итоговый ответ сформирован без LLM" + note + ". "
-            "См. events_summary.json и events.parquet в архиве для деталей."
-        )
-        ev_list = (state.get("query_evidence") or {}).get("evidence") or []
-        final["details"] = [
-            {
-                "time": str(ev.get("time", "")),
-                "description": str(ev.get("text", ""))[:200],
-                "confidence": float(ev.get("confidence", 0.5)),
-                "source_event_id": str(ev.get("event_id", "")),
+        image_paths = state.get("image_paths", []) or []
+        if len(image_paths) > 1:
+            # Множественные изображения — создаем структурированный ответ
+            images_data = {}
+            for img_path in image_paths:
+                image_name = os.path.basename(img_path)
+                image_events = [ev for ev in events if ev.get("video_path") == img_path]  # video_path используется для совместимости
+
+                # Группируем объекты по типам
+                objects_found = {}
+                for ev in image_events:
+                    obj_class = ev.get("class", "unknown")
+                    if obj_class not in objects_found:
+                        objects_found[obj_class] = []
+                    objects_found[obj_class].append({
+                        "bbox": ev.get("bbox", []),
+                        "confidence": ev.get("confidence", 0.0),
+                        "area": ev.get("area", 0),
+                        "description": ev.get("description", ""),
+                    })
+
+                images_data[image_name] = {
+                    "image_path": img_path,
+                    "objects_found": objects_found,
+                    "total_objects": len(image_events),
+                    "objects_by_type": {obj_type: len(objs) for obj_type, objs in objects_found.items()},
+                    "answer": f"Найдено {len(image_events)} объектов на изображении {image_name}",
+                }
+
+            final = {
+                "analysis_type": "multiple_images",
+                "question": user_query,
+                "overall_answer": f"Анализ {len(image_paths)} изображений завершен. Детали по каждому изображению ниже.",
+                "images": images_data,
+                "total_images": len(image_paths),
+                "total_objects": len(events),
+                "models_used": models_used,
             }
-            for ev in ev_list[:15]
-        ]
-        final["confidence"] = float(_avg_conf(events))
-        final["models_used"] = models_used
+        elif len(image_paths) == 1:
+            # Одно изображение — детальный анализ объектов
+            img_path = image_paths[0]
+            image_name = os.path.basename(img_path)
+            image_events = [ev for ev in events if ev.get("video_path") == img_path]
+
+            # Группируем объекты по типам
+            objects_found = {}
+            for ev in image_events:
+                obj_class = ev.get("class", "unknown")
+                if obj_class not in objects_found:
+                    objects_found[obj_class] = []
+                objects_found[obj_class].append({
+                    "bbox": ev.get("bbox", []),
+                    "bbox_xyxy": ev.get("bbox_xyxy", []),
+                    "confidence": ev.get("confidence", 0.0),
+                    "area": ev.get("area", 0),
+                    "description": ev.get("description", ""),
+                })
+
+            final = {
+                "analysis_type": "single_image",
+                "question": user_query,
+                "image_path": img_path,
+                "image_name": image_name,
+                "objects_found": objects_found,
+                "total_objects": len(image_events),
+                "objects_by_type": {obj_type: len(objs) for obj_type, objs in objects_found.items()},
+                "answer": f"На изображении {image_name} найдено {len(image_events)} объектов",
+                "models_used": models_used,
+            }
+        elif len(video_paths) > 1:
+
+            # Добавляем информацию о сохраненных уникальных людях
+            if state.get("save_unique_people", False):
+                final["unique_people_info"] = {
+                    "photos_saved": state.get("unique_people_saved", 0),
+                    "cross_video_overlaps": state.get("cross_video_overlaps", {}),
+                    "unique_people_dir": "unique_people/"
+                }
+        else:
+            # Одно видео — обычный формат
+            note = ""
+            if state.get("error_code") == "GIGACHAT_PAYMENT_REQUIRED":
+                note = " (GigaChat недоступен: 402 Payment Required)"
+            final["answer"] = (
+                "Итоговый ответ сформирован без LLM" + note + ". "
+                "См. events_summary.json и events.parquet в архиве для деталей."
+            )
+            ev_list = (state.get("query_evidence") or {}).get("evidence") or []
+            final["details"] = [
+                {
+                    "time": str(ev.get("time", "")),
+                    "description": str(ev.get("text", ""))[:200],
+                    "confidence": float(ev.get("confidence", 0.5)),
+                    "source_event_id": str(ev.get("event_id", "")),
+                }
+                for ev in ev_list[:15]
+            ]
+            final["confidence"] = float(_avg_conf(events))
+            final["models_used"] = models_used
     elif not require_json and not final:
         # ВАЖНО: не выводим пользователю покадровые списки cv_detection/описания.
         # Отдаём только итоговую, компактную сводку.
@@ -661,7 +1265,10 @@ def generate_final_answer(state: PipelineState) -> PipelineState:
 
 
 def save_results(state: PipelineState) -> PipelineState:
-    pr = ProgressReporter(state.get("progress_cb"))
+    pr = ProgressReporter(
+        progress_cb=state.get("progress_cb"),
+        enable_detailed_logging=bool(state.get("enable_detailed_logging", False))
+    )
     pr.progress(0.95, "save_results: сохранение артефактов")
     pr.log(state, "save_results: start")
 
@@ -775,6 +1382,29 @@ def save_results(state: PipelineState) -> PipelineState:
     }
     save_metadata(out_dir, metadata)
 
+    # Сохраняем уникальных людей, если включено
+    if state.get("save_unique_people", False) and state.get("reid_trajectories"):
+        try:
+            from pipeline.save_results import save_unique_people_photos
+            unique_people_result = save_unique_people_photos(
+                out_dir=out_dir,
+                reid_trajectories=state.get("reid_trajectories", {}),
+                video_paths=state.get("video_paths", []),
+                min_faces=state.get("unique_people_min_faces", 3),
+                quality_threshold=state.get("unique_people_quality_threshold", 0.7)
+            )
+            pr.log(state, f"save_results: saved {len(unique_people_result['saved_photos'])} unique people photos")
+
+            # Добавляем информацию в metadata
+            metadata["unique_people_saved"] = len(unique_people_result["saved_photos"])
+            metadata["cross_video_overlaps"] = unique_people_result["cross_video_overlaps"]
+
+            # Пересохраняем metadata с новой информацией
+            save_metadata(out_dir, metadata)
+
+        except Exception as e:
+            pr.log(state, f"save_results: failed to save unique people: {e}")
+
     state["result_path"] = out_dir
     tzip0 = time.perf_counter()
     state["result_zip_bytes"] = zip_dir_to_bytes(out_dir)
@@ -785,7 +1415,10 @@ def save_results(state: PipelineState) -> PipelineState:
 
 
 def error_handler(state: PipelineState) -> PipelineState:
-    pr = ProgressReporter(state.get("progress_cb"))
+    pr = ProgressReporter(
+        progress_cb=state.get("progress_cb"),
+        enable_detailed_logging=bool(state.get("enable_detailed_logging", False))
+    )
     pr.log(state, "error_handler: start")
     state["error"] = True
     if not state.get("error_code"):

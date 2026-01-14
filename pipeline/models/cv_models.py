@@ -5,16 +5,22 @@ from typing import Any, Optional
 
 import numpy as np
 
-from pipeline.config import load_model_paths
+from pipeline.config import get_yolo_version_from_path, load_model_paths
+from pipeline.models.person_pose_estimator import PersonPoseEstimator
 from pipeline.models.person_reid_bytetrack import PersonReIDTrackerBT
 
 
 @dataclass
 class CVConfig:
-    yolo_model_path: str = "yolov8x.pt"
+    yolo_model_path: str = "yolov8n.pt"
+    yolo_model_version: str = "auto"
+    yolo_input_size: int = 640
     conf_threshold: float = 0.5
     batch_size: int = 8
     osnet_reid_model_path: str = "osnet_x1_0_imagenet.pt"
+    # PRO settings overrides
+    pro_yolo_input_size: Optional[int] = None
+    pro_yolo_conf_threshold: Optional[float] = None
 
 
 class CVModels:
@@ -26,14 +32,26 @@ class CVModels:
     def __init__(self, cfg: Optional[CVConfig] = None):
         if cfg is None:
             mp = load_model_paths()
+            yolo_version = mp.yolo_model_version
+            if yolo_version == "auto":
+                yolo_version = get_yolo_version_from_path(mp.yolo_model_path)
             cfg = CVConfig(
                 yolo_model_path=mp.yolo_model_path,
+                yolo_model_version=yolo_version,
+                yolo_input_size=mp.yolo_input_size,
                 osnet_reid_model_path=mp.osnet_reid_model,
             )
+        # Apply PRO overrides if available
+        if cfg.pro_yolo_input_size is not None:
+            cfg.yolo_input_size = cfg.pro_yolo_input_size
+        if cfg.pro_yolo_conf_threshold is not None:
+            cfg.conf_threshold = cfg.pro_yolo_conf_threshold
+
         self.cfg = cfg
         self._yolo = None
         self._yolo_ok = False
         self._reid_tracker: Optional[PersonReIDTrackerBT] = None
+        self._pose_estimator: Optional[PersonPoseEstimator] = None
         self._track_persist = False
 
         try:
@@ -120,6 +138,11 @@ class CVModels:
             # Быстрый режим: только люди (без bbox в тексте, чтобы не раздувать строки/IO)
             ctx.extend(self._yolo_detect(frame_bgr, allow_labels={"person"}))
 
+        # Pose estimation для анализа движений рук/ног
+        if "pose-estimation" in required_models:
+            pose_ctx = self._process_pose_estimation(frame_bgr, required_models)
+            ctx.extend(pose_ctx)
+
         # ReID / zone-detector в этой версии оставлены как заглушки
         if "zone-detector" in required_models:
             ctx.append("zone_tracker: (stub) zones not configured")
@@ -139,6 +162,7 @@ class CVModels:
             res = self._yolo.predict(
                 source=frames_bgr,
                 conf=float(self.cfg.conf_threshold),
+                imgsz=self.cfg.yolo_input_size,
                 classes=[0],
                 verbose=False,
             )
@@ -170,6 +194,7 @@ class CVModels:
             results = self._yolo.predict(
                 source=frame_bgr,
                 conf=float(self.cfg.conf_threshold),
+                imgsz=self.cfg.yolo_input_size,
                 classes=[0] if allow_labels == {"person"} else None,
                 verbose=False,
             )
@@ -213,6 +238,7 @@ class CVModels:
             results = self._yolo.predict(
                 source=frame_bgr,
                 conf=float(self.cfg.conf_threshold),
+                imgsz=self.cfg.yolo_input_size,
                 classes=[0],
                 verbose=False,
             )
@@ -241,6 +267,7 @@ class CVModels:
                 persist=True,
                 classes=[0],  # person class in COCO
                 conf=float(self.cfg.conf_threshold),
+                imgsz=self.cfg.yolo_input_size,
                 verbose=False,
             )
             self._track_persist = True
@@ -268,17 +295,115 @@ class CVModels:
         except Exception:
             return None
 
+    def _ensure_pose_estimator(self) -> None:
+        if self._pose_estimator is not None:
+            return
+        # Lazy init pose estimator
+        self._pose_estimator = PersonPoseEstimator()
+
+    def _process_pose_estimation(self, frame_bgr: np.ndarray, required_models: list[str]) -> list[str]:
+        """Обрабатывает pose estimation для найденных людей"""
+        self._ensure_pose_estimator()
+        if self._pose_estimator is None or not self._pose_estimator.is_available():
+            return ["Pose: estimator not available"]
+
+        ctx: list[str] = []
+
+        # Получаем боксы людей из YOLO
+        person_dets = []
+        if "yolo-person" in required_models:
+            person_dets = self._yolo_detect_persons(frame_bgr)
+
+        if not person_dets:
+            # Fallback: используем обычную детекцию
+            dets = self._yolo_detect(frame_bgr, allow_labels={"person"})
+            # Извлекаем боксы из описаний (простой парсинг)
+            for desc in dets:
+                if "bbox" in desc:
+                    try:
+                        # Парсим bbox из описания типа "YOLO: person (bbox [x1, y1, x2, y2], conf 0.85)"
+                        import re
+                        bbox_match = re.search(r'bbox \[([^\]]+)\]', desc)
+                        if bbox_match:
+                            bbox_str = bbox_match.group(1)
+                            bbox_vals = [float(x.strip()) for x in bbox_str.split(',')]
+                            if len(bbox_vals) == 4:
+                                person_dets.append((np.array(bbox_vals, dtype=np.float32), 0.5))
+                    except Exception:
+                        continue
+
+        # Оцениваем позу для каждого человека
+        for i, (bbox, conf) in enumerate(person_dets):
+            pose_result = self._pose_estimator.estimate_pose_in_bbox(frame_bgr, bbox)
+            if pose_result:
+                if pose_result.get('stub_mode'):
+                    # Stub mode - provide basic info
+                    ctx.append(f"Person_{i+1}: pose analysis (stub mode - MediaPipe not available)")
+                    continue
+
+                motion = pose_result.get('motion_analysis', {})
+
+                # Формируем описание движений
+                desc_parts = [f"Person_{i+1} pose (conf {pose_result.get('confidence', 0):.2f}):"]
+
+                # Руки
+                hands = motion.get('hand_movements', {})
+                for side in ['left', 'right']:
+                    if side in hands and hands[side]:
+                        elbow_pos = hands[side].get('elbow_position', 'unknown')
+                        desc_parts.append(f"{side} arm {elbow_pos}")
+
+                # Ноги
+                legs = motion.get('leg_movements', {})
+                for side in ['left', 'right']:
+                    if side in legs and legs[side]:
+                        knee_pos = legs[side].get('knee_position', 'unknown')
+                        desc_parts.append(f"{side} leg {knee_pos}")
+
+                # Поза тела
+                posture = motion.get('body_posture', 'unknown')
+                if posture != 'unknown':
+                    desc_parts.append(f"posture: {posture}")
+
+                # Жесты
+                gestures = motion.get('gesture_recognition', [])
+                if gestures:
+                    desc_parts.append(f"gestures: {', '.join(gestures)}")
+
+                ctx.append(" | ".join(desc_parts))
+            else:
+                ctx.append(f"Person_{i+1}: pose estimation failed")
+
+        return ctx if ctx else ["Pose: no persons detected for pose analysis"]
+
 
 _CV_SINGLETON: Optional[CVModels] = None
 
 
-def make_cv_models() -> CVModels:
+def make_cv_models(pro_settings: Optional[dict] = None, yolo_batch_size: int = 16) -> CVModels:
     """
     Кэшируем модели в процессе: повторные запуски через Streamlit не должны каждый раз
     заново грузить YOLO/torchreid, это очень дорого.
     """
     global _CV_SINGLETON
     if _CV_SINGLETON is None:
-        _CV_SINGLETON = CVModels()
+        cfg = None
+        if pro_settings:
+            mp = load_model_paths()
+            yolo_version = mp.yolo_model_version
+            if yolo_version == "auto":
+                yolo_version = get_yolo_version_from_path(mp.yolo_model_path)
+
+            cfg = CVConfig(
+                yolo_model_path=mp.yolo_model_path,
+                yolo_model_version=yolo_version,
+                yolo_input_size=mp.yolo_input_size,
+                conf_threshold=pro_settings.get("yolo_conf_threshold", 0.5),
+                batch_size=yolo_batch_size,  # Используем переданный batch_size
+                osnet_reid_model_path=mp.osnet_reid_model,
+                pro_yolo_input_size=pro_settings.get("yolo_input_size"),
+                pro_yolo_conf_threshold=pro_settings.get("yolo_conf_threshold"),
+            )
+        _CV_SINGLETON = CVModels(cfg)
     return _CV_SINGLETON
 

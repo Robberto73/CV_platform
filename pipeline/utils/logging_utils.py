@@ -12,8 +12,11 @@ def utc_ts() -> str:
 @dataclass
 class ProgressReporter:
     progress_cb: Optional[Callable[[float, str], None]] = None
+    enable_detailed_logging: bool = True
 
     def log(self, state: dict, msg: str) -> None:
+        if not self.enable_detailed_logging:
+            return
         state.setdefault("processing_log", [])
         state["processing_log"].append(f"[{utc_ts()}] {msg}")
 

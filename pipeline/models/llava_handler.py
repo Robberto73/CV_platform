@@ -57,15 +57,28 @@ class LocalLLaVA:
                 "torch_dtype": dtype,
                 "low_cpu_mem_usage": True,
             }
+
             # device_map требует accelerate; включаем только если просим auto и есть CUDA
-            if use_cuda and self.cfg.device_map:
+            # Также отключаем для избежания конфликтов с CUDA
+            if use_cuda and self.cfg.device_map and self.cfg.device_map != "auto":
                 model_kwargs["device_map"] = self.cfg.device_map
+
+            # Устанавливаем device вручную для избежания проблем
+            device = "cuda" if use_cuda else "cpu"
+            if use_cuda:
+                model_kwargs.pop("device_map", None)  # Убираем device_map если используем CUDA
 
             self._model = LlavaForConditionalGeneration.from_pretrained(
                 self.cfg.model_id,
                 **model_kwargs,
             )
-            self._processor = LlavaProcessor.from_pretrained(self.cfg.model_id)
+
+            # Перемещаем модель на устройство
+            self._model = self._model.to(device)
+            self._processor = LlavaProcessor.from_pretrained(
+                self.cfg.model_id,
+                use_fast=True  # Используем быстрый процессор изображений
+            )
         except Exception as e:
             raise LocalLLaVAUnavailable(
                 f"Не удалось загрузить локальную LLaVA модель: {self.cfg.model_id}"
@@ -103,8 +116,40 @@ class LocalLLaVA:
         assert self._model is not None
         assert self._processor is not None
 
+        # Валидация изображения
+        if image is None:
+            return "Ошибка: изображение не предоставлено"
+
+        if not hasattr(image, 'size') or image.size[0] == 0 or image.size[1] == 0:
+            return "Ошибка: некорректное изображение (нулевой размер)"
+
+        # Убедимся, что изображение в RGB
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
+        # Ограничим размер изображения для стабильности
+        max_size = 1024
+        if image.size[0] > max_size or image.size[1] > max_size:
+            image.thumbnail((max_size, max_size), Image.LANCZOS)
+
         formatted = self._format_prompt(prompt, with_image=True)
-        inputs = self._processor(text=formatted, images=image, return_tensors="pt")
+
+        try:
+            inputs = self._processor(text=formatted, images=image, return_tensors="pt")
+
+            # Проверяем, что все тензоры корректные
+            for k, v in inputs.items():
+                if hasattr(v, 'shape') and len(v.shape) > 0:
+                    if any(dim <= 0 for dim in v.shape):
+                        return f"Ошибка: некорректная размерность тензора {k}: {v.shape}"
+
+        except Exception as e:
+            # Попробуем fallback без изображения
+            try:
+                inputs = self._processor(text=formatted, return_tensors="pt")
+                print(f"Предупреждение: изображение пропущено из-за ошибки: {str(e)}")
+            except Exception as e2:
+                return f"Ошибка обработки текста процессором: {str(e2)}"
         inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
 
         assert torch is not None
