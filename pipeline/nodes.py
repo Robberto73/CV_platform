@@ -223,14 +223,28 @@ def prepare_key_frames(state: PipelineState) -> PipelineState:
 
         out_frames: List[Dict[str, Any]] = []
         t_cv0 = time.perf_counter()
-        for f in frames:
-            ctx = cv.describe_frame(
-                f["frame_bgr"],
-                required_models=required_models,
-                frame_id=int(f["frame_id"]),
-                timestamp_sec=float(f["timestamp_sec"]),
-                video_path=vp,
-            )
+        # Быстрый путь: если нужен только yolo-person (без ReID), батчим YOLO по всем выбранным кадрам.
+        only_yolo_person = ("yolo-person" in required_models) and ("reid-osnet" not in required_models) and (
+            len([m for m in required_models if m not in ("yolo-person",)]) == 0
+        )
+        batch_ctx: list[list[str]] = []
+        if only_yolo_person:
+            try:
+                batch_ctx = cv.describe_frames_yolo_person_batch([f["frame_bgr"] for f in frames])
+            except Exception:
+                batch_ctx = []
+
+        for j, f in enumerate(frames):
+            if batch_ctx:
+                ctx = batch_ctx[j] if j < len(batch_ctx) else ["YOLO: no detections"]
+            else:
+                ctx = cv.describe_frame(
+                    f["frame_bgr"],
+                    required_models=required_models,
+                    frame_id=int(f["frame_id"]),
+                    timestamp_sec=float(f["timestamp_sec"]),
+                    video_path=vp,
+                )
             # сохраняем кадр на диск в out/cache/frames (только если PRO+cache_frames)
             frame_file = None
             if state.get("ui_mode") == "PRO" and cfg.cache_frames:

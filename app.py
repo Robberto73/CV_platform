@@ -29,6 +29,43 @@ from pipeline.state import PipelineState
 
 st.set_page_config(page_title="CV Platform — Video Analytics", layout="wide")
 
+_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
+
+
+def _normalize_path(p: str) -> str:
+    p = (p or "").strip().strip('"').strip("'")
+    if not p:
+        return ""
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(p)))
+
+
+def _validate_video_file(path: str) -> str:
+    p = _normalize_path(path)
+    if not p or not os.path.isfile(p):
+        return ""
+    ext = os.path.splitext(p)[1].lower()
+    return p if ext in _VIDEO_EXTS else ""
+
+
+def _collect_videos_from_folder(folder: str, max_files: int = 10) -> list[str]:
+    folder = _normalize_path(folder)
+    if not folder or not os.path.isdir(folder):
+        return []
+    out: list[str] = []
+    try:
+        for root, _, files in os.walk(folder):
+            for fn in files:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext in _VIDEO_EXTS:
+                    out.append(os.path.join(root, fn))
+            # детерминируем порядок и ограничиваем
+            out.sort()
+            if len(out) >= int(max_files):
+                return out[: int(max_files)]
+    except Exception:
+        return []
+    return out[: int(max_files)]
+
 
 def _save_uploads(files: list[Any]) -> list[str]:
     session_id = str(uuid.uuid4())
@@ -226,23 +263,65 @@ with st.sidebar:
         ).strip() or None
 
 
-uploaded_files = st.file_uploader(
-    "Загрузите видео (макс. 2 ГБ на файл)",
-    type=["mp4", "avi", "mov"],
-    accept_multiple_files=True,
+st.subheader("Источник видео")
+input_mode = st.radio(
+    "Выберите, как задать видео",
+    ["Загрузка (Upload)", "Путь к файлу", "Путь к папке"],
+    index=0,
+    horizontal=True,
+    help="Upload удобен для разовых тестов. Путь к файлу/папке удобен на Linux-сервере (видео уже на диске).",
 )
 
-if uploaded_files and len(uploaded_files) > 10:
-    st.error("Можно загрузить максимум 10 файлов за раз.")
-    uploaded_files = uploaded_files[:10]
+path_video_file = ""
+path_video_folder = ""
+selected_video_paths: list[str] = []
 
-if uploaded_files:
-    st.subheader("Превью")
-    cols = st.columns(min(3, len(uploaded_files)))
-    for i, f in enumerate(uploaded_files):
-        with cols[i % len(cols)]:
-            st.caption(f.name)
-            st.video(f)
+if input_mode == "Загрузка (Upload)":
+    uploaded_files = st.file_uploader(
+        "Загрузите видео (макс. 2 ГБ на файл)",
+        type=["mp4", "avi", "mov"],
+        accept_multiple_files=True,
+    )
+    if uploaded_files and len(uploaded_files) > 10:
+        st.error("Можно загрузить максимум 10 файлов за раз.")
+        uploaded_files = uploaded_files[:10]
+
+    if uploaded_files:
+        st.subheader("Превью")
+        cols = st.columns(min(3, len(uploaded_files)))
+        for i, f in enumerate(uploaded_files):
+            with cols[i % len(cols)]:
+                st.caption(f.name)
+                st.video(f)
+else:
+    # В других режимах явно сбрасываем upload, чтобы ниже не было неоднозначности.
+    uploaded_files = []
+
+if input_mode == "Путь к файлу":
+    path_video_file = st.text_input(
+        "Путь к видео файлу (mp4/avi/mov/mkv)",
+        value="",
+        placeholder=r"Например: D:\videos\test.mp4 или /data/videos/test.mp4",
+    )
+    p = _validate_video_file(path_video_file)
+    if path_video_file and not p:
+        st.warning("Файл не найден или расширение не поддерживается.")
+    if p:
+        selected_video_paths = [p]
+        st.caption(f"Файл: {p}")
+
+elif input_mode == "Путь к папке":
+    path_video_folder = st.text_input(
+        "Путь к папке с видео",
+        value="",
+        placeholder=r"Например: D:\videos\ или /data/videos/",
+    )
+    p = _normalize_path(path_video_folder)
+    if path_video_folder and not os.path.isdir(p):
+        st.warning("Папка не найдена.")
+    if os.path.isdir(p):
+        selected_video_paths = _collect_videos_from_folder(p, max_files=10)
+        st.caption(f"Найдено видео: {len(selected_video_paths)} (лимит 10)")
 
 user_query = st.text_area(
     "Ваш вопрос по видео",
@@ -251,10 +330,15 @@ user_query = st.text_area(
 require_json = st.checkbox("Требуется JSON-ответ", help="Строгий формат JSON для интеграций")
 
 
-run_btn = st.button("Запустить анализ", type="primary", disabled=not uploaded_files or not user_query)
+has_any_videos = bool(uploaded_files) or bool(selected_video_paths)
+run_btn = st.button("Запустить анализ", type="primary", disabled=not has_any_videos or not user_query)
 
 if run_btn:
-    video_paths = _save_uploads(list(uploaded_files or []))
+    # НЕ меняем схему state: всегда формируем `video_paths`.
+    if input_mode == "Загрузка (Upload)":
+        video_paths = _save_uploads(list(uploaded_files or []))
+    else:
+        video_paths = list(selected_video_paths)
 
     progress = st.progress(0)
     stage = st.empty()

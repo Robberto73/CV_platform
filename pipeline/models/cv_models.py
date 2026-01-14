@@ -61,9 +61,17 @@ class CVModels:
         if self._reid_tracker is not None:
             return
         # Lazy init, чтобы не грузить torchreid/torch без необходимости
+        device = "cuda"
+        try:
+            import torch  # type: ignore
+
+            if not bool(getattr(torch, "cuda", None)) or not torch.cuda.is_available():
+                device = "cpu"
+        except Exception:
+            device = "cpu"
         self._reid_tracker = PersonReIDTrackerBT(
             osnet_weights_path=self.cfg.osnet_reid_model_path,
-            device="cuda",
+            device=device,
         )
 
     def describe_frame(
@@ -117,6 +125,42 @@ class CVModels:
             ctx.append("zone_tracker: (stub) zones not configured")
 
         return ctx
+
+    def describe_frames_yolo_person_batch(self, frames_bgr: list[np.ndarray]) -> list[list[str]]:
+        """
+        Быстрый путь: батч-инференс YOLO по списку кадров.
+        Используем только когда нужны именно люди (yolo-person) без ReID/трекинга.
+        """
+        if not frames_bgr:
+            return []
+        if not self._yolo_ok or self._yolo is None:
+            return [["YOLO: (stub) model not available"] for _ in frames_bgr]
+        try:
+            res = self._yolo.predict(
+                source=frames_bgr,
+                conf=float(self.cfg.conf_threshold),
+                classes=[0],
+                verbose=False,
+            )
+            out: list[list[str]] = []
+            for r in res:
+                if r.boxes is None or getattr(r.boxes, "conf", None) is None:
+                    out.append(["YOLO: no detections"])
+                    continue
+                confs = r.boxes.conf.cpu().numpy().tolist()
+                n = len(confs)
+                if n <= 0:
+                    out.append(["YOLO: no detections"])
+                    continue
+                cm = max(float(x) for x in confs) if confs else 0.0
+                ca = (sum(float(x) for x in confs) / max(1, n)) if confs else 0.0
+                out.append([f"YOLO: person count={n} conf_max={cm:.2f} conf_mean={ca:.2f}"])
+            # safety: если SDK/ultralytics вернул меньше результатов, дополним
+            while len(out) < len(frames_bgr):
+                out.append(["YOLO: no detections"])
+            return out[: len(frames_bgr)]
+        except Exception as e:
+            return [[f"YOLO: error during inference: {type(e).__name__}: {e}"] for _ in frames_bgr]
 
     def _yolo_detect(self, frame_bgr: np.ndarray, allow_labels: Optional[set[str]] = None) -> list[str]:
         if not self._yolo_ok or self._yolo is None:

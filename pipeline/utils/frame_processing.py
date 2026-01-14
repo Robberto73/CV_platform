@@ -177,13 +177,18 @@ def decode_and_select_frames(
     kept = 0
     try:
         while True:
-            ok, frame = cap.read()
+            # ВАЖНО: для ускорения пропуска кадров используем grab() без декодирования.
+            ok = cap.grab()
             if not ok:
                 break
 
             if idx % step != 0:
                 idx += 1
                 continue
+
+            ok2, frame = cap.retrieve()
+            if not ok2:
+                break
 
             timestamp_sec = float(idx / fps)
             frame_hash = _fast_frame_fingerprint(frame)
